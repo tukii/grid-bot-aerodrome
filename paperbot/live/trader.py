@@ -251,11 +251,13 @@ class LiveGridTrader:
         valid_levels = {round(lv.price, 8) for lv in self.grid.buy_levels} | \
                        {round(lv.price, 8) for lv in self.grid.sell_levels} | \
                        {round(self.grid.anchor, 8)}
-        for p, side in list(self._orders.items()):
+        # Poda de órdenes fantasma ANTES de evaluar fills: los niveles del grid
+        # vigente (re-anchor o cambio de config) invalidan las órdenes viejas.
+        for p in list(self._orders.keys()):
             if round(p, 8) not in valid_levels:
-                logger.warning("orden fantasma %s@%.2f fuera del grid vigente -> descartada", side, p)
+                logger.warning("orden fantasma %s@%.2f fuera del grid vigente -> descartada", self._orders[p], p)
                 del self._orders[p]
-                continue
+        for p, side in list(self._orders.items()):
             if side == "buy" and p >= price:
                 filled = self._execute_buy(p)
                 if filled:
@@ -266,10 +268,6 @@ class LiveGridTrader:
 
         # trigger pending sells
         for p, side in list(self._orders.items()):
-            if round(p, 8) not in valid_levels:
-                logger.warning("orden fantasma %s@%.2f fuera del grid vigente -> descartada", side, p)
-                del self._orders[p]
-                continue
             if side == "sell" and p <= price:
                 filled = self._execute_sell(p)
                 if filled:

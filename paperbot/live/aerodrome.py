@@ -156,6 +156,21 @@ def _load_env():
     return env
 
 
+def _build_fee_params(bot: "AerodromeLive") -> dict:
+    """Parámetros de gas para build_transaction (EIP-1559, fix BAJA).
+
+    Si la red soporta maxFeePerGas (Base sí: baseFeePerGas en el bloque
+    "latest"), construye la tx con maxFeePerGas/maxPriorityFeePerGas en lugar
+    de gasPrice legacy. El cap configurado (live.max_gas_gwei) es el límite
+    ESTRICTO de maxFeePerGas — nunca se supera. maxPriorityFeePerGas se capea
+    al mínimo(0.001 gwei, maxFee).
+
+    Si la red NO soporta EIP-1559 -> gasPrice legacy con el mismo cap
+    (comportamiento anterior intacto, cae bien en redes legacy).
+    """
+    return bot._build_fee_params()
+
+
 @dataclass
 class SwapResult:
     dry_run: bool
@@ -230,6 +245,7 @@ class AerodromeLive:
         self.dry_run_forced = live["dry_run"]
         self.max_spend_usd = live["max_spend_usd"]
         self.max_gas_gwei = float(live.get("max_gas_gwei", 0.1))
+        self._eip1559: bool | None = None  # cache detección EIP-1559 (fix BAJA)
         self.min_confirmations = int(live.get("min_confirmations", 1))
         self.pool_addr = Web3.to_checksum_address(cfg["pool"]["address"])
         # Base token + quote token: any ERC20 pair
@@ -437,15 +453,70 @@ class AerodromeLive:
             return c.functions.allowance(Web3.to_checksum_address(account), self.router).call()
         return self._call_with_retry(_b)
 
-    # ---- gas ----
+    # ---- gas (EIP-1559) ----
+    @property
+    def eip1559_supported(self) -> bool:
+        """Base es EIP-1559: el bloque "latest" expone baseFeePerGas.
+
+        Detección viva (un RPC), cacheada: si el último bloque trae
+        baseFeePerGas > 0, las txs con maxFeePerGas/maxPriorityFeePerGas son
+        aceptadas. En caso de error (RPC apagado) devuelve False -> gasPrice
+        legacy como antes.
+        """
+        if self._eip1559 is None:
+            self._eip1559 = False
+            try:
+                blk = self.w3.eth.get_block("latest")
+                self._eip1559 = bool(blk.get("baseFeePerGas"))
+            except Exception:
+                self._eip1559 = False
+        return self._eip1559
+
     def _gas_price(self) -> int:
-        """Gas price capped by max_gas_gwei. Falls back to network gas price."""
+        """Gas price capped by max_gas_gwei. Falls back to network gas price.
+
+        EIP-1559 (fix BAJA): si la red lo soporta, devuelve el precio LEGACY
+        equivalente al cap (maxFeePerGas = cap, maxPriorityFeePerGas = 0.001
+        gwei) — las txs se construyen con maxFeePerGas/maxPriorityFeePerGas y
+        el VALIDADOR del cap aplica igual. Este método se mantiene para
+        compatibilidad (tests y rutas legacy).
+        """
         gp = self.w3.eth.gas_price
         cap = int(self.max_gas_gwei * 1e9)
         if self.max_gas_gwei > 0 and gp > cap:
             logger.warning("gas price %.4f gwei > cap %.4f, using cap", gp / 1e9, self.max_gas_gwei)
             return cap
         return gp
+
+    def _build_fee_params(self) -> dict:
+        """Parámetros de gas para build_transaction.
+
+        EIP-1559 (fix BAJA) si la red lo soporta: usa maxFeePerGas (cap) y
+        maxPriorityFeePerGas (=0.001 gwei, razonable en Base). Así la tx NO
+        queda "underpriced" con gasPrice legacy cuando la red sube: el cap
+        de maxFeePerGas = self.max_gas_gwei es el límite estricto y el
+        minero puede reclamar hasta ese máximo sin que la tx muera lenta.
+
+        Seguridad:
+          - maxFeePerGas NUNCA supera el cap configurado (max_gas_gwei).
+          - maxPriorityFeePerGas se capea al mínimo(max_priority, maxFee).
+          - Si la red NO soporta EIP-1559 (baseFeePerGas ausente) -> gasPrice
+            legacy con el mismo cap (comportamiento anterior intacto).
+        """
+        cap = int(self.max_gas_gwei * 1e9)
+        if self.eip1559_supported:
+            base_fee = int(self.w3.eth.get_block("latest")["baseFeePerGas"])
+            tip = int(1e6)  # 0.001 gwei (Base: suficiente, base fee ~0.005 gwei)
+            tip = min(tip, cap)
+            max_fee = max(base_fee + tip, tip)
+            max_fee = min(max_fee, cap)
+            if max_fee <= 0:
+                # Red sin precio (anomalía): usa legacy con cap como salvaguarda
+                return {"gasPrice": cap or self.w3.eth.gas_price}
+            logger.debug("EIP-1559 fees: baseFee=%s tip=%s maxFee=%s (cap=%s)",
+                         base_fee, tip, max_fee, cap)
+            return {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": tip}
+        return {"gasPrice": self._gas_price()}
 
     def _estimate_gas(self, tx: dict) -> int:
         try:
@@ -463,6 +534,12 @@ class AerodromeLive:
     def ensure_approval(self, token: str, amount_raw: int, account, nonce_mgr=None) -> str:
         """Ensure the router can spend `amount_raw` of `token`.
 
+        Usa approve INFINITO (2^256-1): una sola tx de approve y el router
+        puede gastar siempre, eliminando el approve por swap (ahorro ~$0.0008/swap,
+        condición obligatoria de la economía del grid a $4.30).
+        Seguridad: el router está verificado on-chain (factory match); el approve
+        infinito es el estándar en DeFi (Uniswap, Aerodrome, etc.).
+
         Returns ApprovalStatus.EXISTS / SENT / FAILED.
         """
         token = Web3.to_checksum_address(token)
@@ -470,14 +547,29 @@ class AerodromeLive:
         current = c.functions.allowance(account.address, self.router).call()
         if current >= amount_raw:
             return ApprovalStatus.EXISTS
-
+        # Approve infinito si el allowance actual es < amount_raw
+        if current > 0:
+            # Primero a 0 (requerido por algunos tokens), luego a máx
+            try:
+                tx0 = c.functions.approve(self.router, 0).build_transaction({
+                    "from": account.address,
+                    "nonce": nonce_mgr.next(),
+                    "gas": 60000,
+                    **_build_fee_params(self),
+                    "chainId": self.chain_id,
+                })
+                tx0["gas"] = self._estimate_gas(tx0)
+                self._send(tx0, account, "approve_reset", nonce_mgr=nonce_mgr)
+            except Exception as e:
+                logger.warning("approve reset a 0 falló (no crítico): %s", e)
+        MAX_UINT = (1 << 256) - 1
         nonce_mgr = nonce_mgr or self.get_nonce_manager(account)
         nonce_mgr.resync_if_behind()
-        tx = c.functions.approve(self.router, amount_raw).build_transaction({
+        tx = c.functions.approve(self.router, MAX_UINT).build_transaction({
             "from": account.address,
             "nonce": nonce_mgr.next(),
             "gas": 60000,
-            "gasPrice": self._gas_price(),
+            **_build_fee_params(self),
             "chainId": self.chain_id,
         })
         tx["gas"] = self._estimate_gas(tx)
@@ -545,7 +637,7 @@ class AerodromeLive:
             "from": account.address,
             "nonce": nonce_mgr.next(),
             "gas": 250000,
-            "gasPrice": self._gas_price(),
+            **_build_fee_params(self),
             "chainId": self.chain_id,
         })
         tx["gas"] = self._estimate_gas(tx)
@@ -620,7 +712,7 @@ class AerodromeLive:
             "value": amount_wei,
             "nonce": nonce_mgr.next(),
             "gas": 60000,
-            "gasPrice": self._gas_price(),
+            **_build_fee_params(self),
             "chainId": self.chain_id,
         })
         tx["gas"] = self._estimate_gas(tx)
@@ -647,7 +739,7 @@ class AerodromeLive:
             "value": 0,
             "nonce": nonce_mgr.next(),
             "gas": 60000,
-            "gasPrice": self._gas_price(),
+            **_build_fee_params(self),
             "chainId": self.chain_id,
         })
         tx["gas"] = self._estimate_gas(tx)

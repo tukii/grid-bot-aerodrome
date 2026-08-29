@@ -145,6 +145,13 @@ def read_config() -> dict:
             section = line[:-1].strip()
             cfg[section] = {}
             continue
+        if line.lstrip().startswith("telegram_bot_token:"):
+            # El valor puede ser '' (string vacío, config sin token tras el fix
+            # BAJA): el parser genérico lo dejaría como "''" (falsy pero sucio);
+            # lo normalizamos a cadena limpia o ''.
+            v = line.partition(":")[2].strip().strip("'").strip('"').strip()
+            cfg[section]["telegram_bot_token"] = "" if v in ("", "''", '""') else v
+            continue
         if ":" in line and section:
             k, _, v = line.partition(":")
             cfg[section][k.strip()] = v.strip()
@@ -198,21 +205,12 @@ def reanchor_config(new_anchor: float, reason: str) -> bool:
     return ok
 
 
-def send_telegram(msg: str):
-    """Envía alerta. PRIORIDAD: config.yaml (alerts.telegram_chat_id) sobre ~/trading/.env.
+def _env_telegram() -> tuple[str, str]:
+    """Lee token/chat_id de ~/trading/.env (fuente privilegiada, no versionada).
 
-    El grid bot es de Pablo: el chat_id de config.yaml (504820277) manda.
-    El token se toma de ~/trading/.env (real) o config.yaml.
+    Devuelve (token, chat_id); '' si no están.
     """
     token = chat = ""
-    # Fuente 1 (chat): config.yaml — chat_id del grid bot (Pablo)
-    try:
-        cfg = read_config()
-        chat = (cfg.get("alerts") or {}).get("telegram_chat_id", "") or chat
-        token = (cfg.get("alerts") or {}).get("telegram_bot_token", "") or token
-    except Exception:
-        pass
-    # Fuente 2 (token/chat fallback): ~/trading/.env
     try:
         if TRADING_ENV.exists():
             for line in TRADING_ENV.read_text().splitlines():
@@ -223,6 +221,30 @@ def send_telegram(msg: str):
                     chat = line.split("=", 1)[1].strip().strip('"').strip("'")
     except Exception as e:
         log.debug("leyendo ~/trading/.env: %s", e)
+    return token, chat
+
+
+def send_telegram(msg: str):
+    """Envía alerta. PRIORIDAD (fix BAJA): ~/trading/.env sobre config.yaml.
+
+    El token de Telegram es un secreto: NO debe vivir en config.yaml (archivo
+    versionable). Fuente 1 = ~/trading/.env (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).
+    Fuente 2 (fallback) = alerts.telegram_* en config.yaml, SOLO si el .env no
+    tiene las claves. config.yaml ya no lleva el token (se dejó vacío); si aún
+    apareciera un token antiguo ahí, el del .env gana.
+    """
+    token = chat = ""
+    # Fuente 1 (privilegiada): ~/trading/.env
+    token, chat = _env_telegram()
+    # Fuente 2 (fallback): config.yaml
+    try:
+        cfg = read_config()
+        if not chat:
+            chat = (cfg.get("alerts") or {}).get("telegram_chat_id", "") or chat
+        if not token:
+            token = (cfg.get("alerts") or {}).get("telegram_bot_token", "") or token
+    except Exception:
+        pass
     if not token or not chat:
         return False
     try:
