@@ -91,6 +91,20 @@ def cmd_live(args):
     from paperbot.paper.store import Store
     cfg = load_config()
     live = cfg["live"]
+    # HALT FLAG: si el supervisor marcó halted=true (stop-loss duro), el bot NO
+    # debe operar aunque systemd lo reintente. Sale con exit 0 sin tocar nada.
+    try:
+        store = Store(live["db_path"])
+        halted = store.get_meta("halted")
+        if halted and halted.strip().lower() in ("1", "true", "yes"):
+            print("HALTED: grid-bot fue parado por stop-loss (meta 'halted' en DB). "
+                  "No se opera. Limpia la meta 'halted' manualmente para reanudar.")
+            logging.getLogger("paperbot.live").warning(
+                "HALTED flag presente en DB -> saliendo sin operar (exit 0)")
+            sys.exit(0)
+        store.close()
+    except Exception as e:
+        logging.getLogger("paperbot.live").error("check halted falló (no bloquea): %s", e)
     if not live["enabled"] and not args.dry_run:
         print("ERROR: live.enabled=false en config.yaml. Usa --dry-run o activa live.enabled=true.")
         sys.exit(1)

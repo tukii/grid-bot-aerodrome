@@ -104,6 +104,35 @@ def read_meta(key: str):
         return None
 
 
+def write_meta(key: str, value: str):
+    """Escribe una meta en la DB (crea la tabla si no existe)."""
+    try:
+        import sqlite3
+        con = sqlite3.connect(DB)
+        con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        con.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+        con.commit()
+        con.close()
+        return True
+    except Exception as e:
+        log.error("escribiendo meta %s: %s", key, e)
+        return False
+
+
+def halt_bot(reason: str) -> bool:
+    """Marca halted=true en la DB y para el servicio.
+
+    El flag lo lee bot.py al arrancar: si está, el bot sale con exit 0 sin
+    operar (no vuelve a tocar el mercado aunque systemd Restart=always lo
+    reintente). Solo un operador (o la rotación manual) debe limpiar el flag.
+    """
+    ok = write_meta("halted", "true")
+    log.warning("HALT FLAG: halted=true escrito en DB (%s)", reason)
+    r = subprocess.run(["systemctl", "--user", "stop", "grid-bot.service"],
+                       capture_output=True, text=True)
+    return ok and r.returncode == 0
+
+
 def read_config() -> dict:
     """Parse ligero del YAML (solo las claves que nos interesan)."""
     cfg = {}
@@ -261,10 +290,11 @@ def main_loop():
                     prev_critical = state.get("critical_dd", False)
                     if prev_critical:
                         log.warning("STOP-LOSS DURO: drawdown %.1f%% sostenido -> parando grid-bot", dd)
-                        subprocess.run(["systemctl", "--user", "stop", "grid-bot.service"],
-                                       capture_output=True, text=True)
+                        halted = halt_bot(f"drawdown {dd:.1f}% >= stop_loss {sl:.1f}%")
                         send_telegram(f"🛑 STOP-LOSS DURO: drawdown {dd:.1f}% >= {sl:.1f}% en 2 ciclos. "
-                                      f"grid-bot PARADO. Revisar antes de reanudar.")
+                                      f"grid-bot PARADO (halted=true). "
+                                      f"{'Bot no reintentará operar' if halted else '⚠️ FALLO al marcar halted: el bot podría reintentar'} "
+                                      f"— limpiar meta 'halted' manualmente antes de reanudar.")
                         state["critical_dd"] = False
                     else:
                         state["critical_dd"] = True

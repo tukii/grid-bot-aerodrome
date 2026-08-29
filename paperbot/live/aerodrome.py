@@ -244,6 +244,13 @@ class AerodromeLive:
         self._quoter_contract = self.w3.eth.contract(address=self.quoter, abi=QUOTER_ABI)
         self._factory_verify_ts = 0.0
         self._factory_verify_ok = False
+        # NonceManager persistente por proceso: se reutiliza entre approve+swap,
+        # rebalance y wraps. resync_if_behind() antes de cada build evita reutilizar
+        # nonces tras conmutación de RPC (la cuenta "pending" de un nodo puede ir
+        # atrasada). Se crea perezosamente en el primer uso (la clave no se conoce
+        # hasta get_account, que requiere PRIVATE_KEY del .env).
+        self._nonce_manager = None
+        self._nonce_manager_addr = None
 
     def _read_decimals(self):
         """Read decimals from chain; fall back to config values."""
@@ -282,7 +289,17 @@ class AerodromeLive:
         return self.w3.eth.account.from_key(key)
 
     def get_nonce_manager(self, account) -> NonceManager:
-        return NonceManager(self.w3, account.address)
+        """Devuelve el NonceManager persistente del proceso (uno por cuenta).
+
+        Si el NonceManager aún no existe (o la cuenta cambió, p.ej. rotación
+        de activo) lo crea. Si la instancia previa quedó vinculada a otra
+        cuenta, se descarta para no reutilizar nonces de otra wallet.
+        """
+        addr = Web3.to_checksum_address(account.address)
+        if self._nonce_manager is None or self._nonce_manager_addr != addr:
+            self._nonce_manager = NonceManager(self.w3, addr)
+            self._nonce_manager_addr = addr
+        return self._nonce_manager
 
     # ---- security verification (cached 5 min) ----
     def verify_on_chain(self, force: bool = False) -> bool:
@@ -454,7 +471,8 @@ class AerodromeLive:
         if current >= amount_raw:
             return ApprovalStatus.EXISTS
 
-        nonce_mgr = nonce_mgr or NonceManager(self.w3, account.address)
+        nonce_mgr = nonce_mgr or self.get_nonce_manager(account)
+        nonce_mgr.resync_if_behind()
         tx = c.functions.approve(self.router, amount_raw).build_transaction({
             "from": account.address,
             "nonce": nonce_mgr.next(),
@@ -468,7 +486,16 @@ class AerodromeLive:
 
     # ---- swap ----
     def swap_exact_in(self, token_in: str, token_out: str, amount_in_raw: int,
-                      account=None, dry_run: bool | None = None) -> SwapResult:
+                      account=None, dry_run: bool | None = None,
+                      min_out_override: int | None = None) -> SwapResult:
+        """Swap exact input.
+
+        min_out_override: mínimo de salida en raw units (token_out) fijado por
+        el llamador — p.ej. el trader lo ancla al precio del NIVEL de grid
+        esperado (no al quote vivo) para que un gap de 5-25% revierta la tx en
+        lugar de ejecutar a precio de mercado. None => 0.997 x quote (comporta-
+        miento original, p.ej. unwind como market sell).
+        """
         dry_run = self.dry_run_forced if dry_run is None else dry_run
         token_in = Web3.to_checksum_address(token_in)
         token_out = Web3.to_checksum_address(token_out)
@@ -481,7 +508,7 @@ class AerodromeLive:
         if quote_out is None:
             return SwapResult(dry_run, False, None, None, None, "quote failed")
 
-        min_out = int(quote_out * (1 - self.slippage))
+        min_out = min_out_override if min_out_override is not None else int(quote_out * (1 - self.slippage))
         deadline = self.w3.eth.get_block("latest")["timestamp"] + 300
 
         if dry_run:
@@ -491,7 +518,8 @@ class AerodromeLive:
         if account is None:
             account = self.get_account()
 
-        nonce_mgr = NonceManager(self.w3, account.address)
+        nonce_mgr = self.get_nonce_manager(account)
+        nonce_mgr.resync_if_behind()
 
         # Ensure approval for the input token (WETH or USDC). Share nonce_mgr.
         approval = self.ensure_approval(token_in, amount_in_raw, account, nonce_mgr)
@@ -585,7 +613,8 @@ class AerodromeLive:
         bal = self.eth_balance(account.address)
         if amount_wei > bal:
             return SwapResult(False, False, None, amount_wei, None, "insufficient native ETH")
-        nonce_mgr = NonceManager(self.w3, account.address)
+        nonce_mgr = self.get_nonce_manager(account)
+        nonce_mgr.resync_if_behind()
         tx = weth.functions.deposit().build_transaction({
             "from": account.address,
             "value": amount_wei,
@@ -611,9 +640,11 @@ class AerodromeLive:
         bal = self.token_balance(self.weth, account.address)
         if amount_wei > bal:
             return SwapResult(False, False, None, amount_wei, None, "insufficient WETH")
-        nonce_mgr = NonceManager(self.w3, account.address)
+        nonce_mgr = self.get_nonce_manager(account)
+        nonce_mgr.resync_if_behind()
         tx = weth.functions.withdraw(amount_wei).build_transaction({
             "from": account.address,
+            "value": 0,
             "nonce": nonce_mgr.next(),
             "gas": 60000,
             "gasPrice": self._gas_price(),

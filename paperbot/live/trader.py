@@ -307,8 +307,15 @@ class LiveGridTrader:
             logger.info("buy@%.2f skip: order too small", level_price)
             return False
         logger.info("BUY base @ %.2f (swap %s USDC -> base)", level_price, usdc_max / 10 ** b.quote_decimals)
+        # min_out anclado al NIVEL de grid esperado (no al quote vivo): si el pool
+        # se movió y el precio real está >= 5-25% peor, la tx revierte en cadena en
+        # lugar de comprar a precio de mercado. +1% de margen sobre el nivel (la
+        # compra en grid se da cuando price cruza el nivel hacia abajo; el precio
+        # real puede estar ligeramente por debajo).
+        min_out_override = int(usdc_max / (level_price * 1.01) * 10 ** b.base_decimals)
         r = b.swap_exact_in(b.usdc, b.base_token, usdc_max,
-                            account=self.account, dry_run=self.dry_run)
+                            account=self.account, dry_run=self.dry_run,
+                            min_out_override=min_out_override)
         logger.info("BUY result: %s", r.message)
         self._record_trade("buy", level_price, usdc_max / 10 ** b.quote_decimals, r)
         filled = bool(r.ok and r.receipt_status == 1)
@@ -331,8 +338,14 @@ class LiveGridTrader:
             return False
         logger.info("SELL base @ %.2f (swap %s base -> USDC)", level_price,
                     base_amt / 10 ** b.base_decimals)
+        # min_out anclado al NIVEL de grid esperado: se vende al nivel del grid,
+        # no al precio de mercado del momento. -1% de margen sobre el nivel (la
+        # venta en grid se da cuando price cruza el nivel hacia arriba; el precio
+        # real puede estar ligeramente por encima).
+        min_out_override = int(base_amt * (level_price * 0.99) / 10 ** b.base_decimals * 10 ** b.quote_decimals)
         r = b.swap_exact_in(b.base_token, b.usdc, base_amt,
-                            account=self.account, dry_run=self.dry_run)
+                            account=self.account, dry_run=self.dry_run,
+                            min_out_override=min_out_override)
         logger.info("SELL result: %s", r.message)
         self._record_trade("sell", level_price,
                            base_amt / 10 ** b.base_decimals * level_price, r)

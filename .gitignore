@@ -19,6 +19,10 @@ config.backup*.yaml
 # Config con tokens (el token de Telegram está en config.yaml)
 config.yaml
 
+# Backups de código
+*.bak.*
+*.bak
+
 # Sistema
 .DS_Store
 *.swp
