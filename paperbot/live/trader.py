@@ -142,7 +142,18 @@ class LiveGridTrader:
             self._orders[round(lv.price, 8)] = "buy"
         for lv in self.grid.sell_levels:
             self._orders[round(lv.price, 8)] = "sell"
-        self._orders[round(self.grid.anchor, 8)] = "buy"
+        # Anchor-buy SOLO si no hay posición base (alineado con el backtest).
+        # Evita comprar $0.50 extra fuera de estrategia en cada rebuild.
+        try:
+            base_bal = self.bot.token_balance(self.bot.base_token, self.account.address) / 10 ** self.bot.base_decimals
+            base_usd = base_bal * self._last_price if self._last_price else 0.0
+            if base_usd < 0.05:
+                self._orders[round(self.grid.anchor, 8)] = "buy"
+            else:
+                logger.info("_reset_orders: hay posición base (~$%.4f), NO añado anchor-buy", base_usd)
+        except Exception as e:
+            logger.warning("_reset_orders: no pude leer balance base (%s); añado anchor-buy por defecto", e)
+            self._orders[round(self.grid.anchor, 8)] = "buy"
         self._save_state()
 
     # ---- re-anchoring ----

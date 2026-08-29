@@ -325,18 +325,29 @@ def main_loop():
                         send_telegram(f"🔄 Re-anchor grid a ${price:.2f} (drift {drift:.1f}%)")
                         state["last_reanchor_ts"] = time.time() if ok else state.get("last_reanchor_ts", 0)
                     else:
-                        # órdenes de compra todas lejos por debajo (capital dormido)
+                        # "Capital dormido" solo si el precio lleva MUCHO tiempo fuera del
+                        # rango del grid (el mayor buy SIEMPRE está a -spacing% en grid fijo,
+                        # así que "lejos del mayor buy" es normal). Evita re-anclas inútiles
+                        # que cuestan gas de rebalance (falso positivo estructural).
                         orders = gs.get("orders", {})
                         buys = [float(k) for k, v in orders.items() if v == "buy"]
-                        if buys:
+                        sells = [float(k) for k, v in orders.items() if v == "sell"]
+                        if buys and sells and price:
+                            lowest_sell = min(sells)
                             highest_buy = max(buys)
-                            if price and highest_buy < price * 0.97 and cooldown > 3600:
-                                log.info("capital dormido: mayor buy $%.2f < precio $%.2f (-%.1f%%) -> re-anclar",
-                                         highest_buy, price, (price - highest_buy) / price * 100)
-                                log_action(state, "reanchor_sleeping", f"highest_buy {highest_buy} vs price {price}")
-                                state["last_reanchor_ts"] = time.time()
-                                ok = reanchor_config(price, "capital dormido (buys lejos)")
-                                send_telegram(f"🔄 Re-anchor (capital dormido) a ${price:.2f}")
+                            # Solo re-anclar si el precio está FUERA del rango [mayor buy, menor sell]
+                            if price > lowest_sell * 1.02 or price < highest_buy * 0.98:
+                                if cooldown > 3600 * 6:  # 6h mínimo, no cada hora
+                                    log.info("precio $%.2f fuera del rango del grid [%.2f, %.2f] -> re-anclar",
+                                             price, highest_buy, lowest_sell)
+                                    log_action(state, "reanchor_out_of_range",
+                                               f"price {price} fuera de [{highest_buy}, {lowest_sell}]")
+                                    state["last_reanchor_ts"] = time.time()
+                                    ok = reanchor_config(price, "precio fuera del rango del grid")
+                                    send_telegram(f"🔄 Re-anchor (precio fuera de rango) a ${price:.2f}")
+                            else:
+                                log.info("precio $%.2f DENTRO del rango del grid [%.2f, %.2f] -> sin re-anclar",
+                                         price, highest_buy, lowest_sell)
 
             # 4. Persistir estado y dormir
             save_state(state)
