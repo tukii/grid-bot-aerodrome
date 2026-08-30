@@ -39,6 +39,7 @@ def _make_trader(monkeypatch, tmp_path, grid_cfg=None):
             "min_liquidity_usd": 1e6, "min_volume_usd": 1e6,
             "rotation_enabled": False, "rotation_interval_h": 6.0,
             "min_vol_ratio": 1.5, "db_path": "x.db",
+            "min_order_usd": 0.01,
         },
     }
     if grid_cfg:

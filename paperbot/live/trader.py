@@ -324,10 +324,17 @@ class LiveGridTrader:
         base_need = self._order_size_base(total)
         usdc_needed_raw = int(base_need * level_price / 10 ** b.base_decimals * 10 ** b.quote_decimals)
         usdc_max = min(usdc_needed_raw, b.token_balance(b.usdc, self.account.address))
+        usdc_max_usd = usdc_max / 10 ** b.quote_decimals
+        # Idea Hummingbot (min_order_amount_quote): no ejecutar órdenes tan pequeñas
+        # que las fees/gas se las coman. Umbral configurable (min_order_usd).
+        min_order_usd = self.live_cfg.get("min_order_usd", 0.25)
+        if usdc_max_usd < min_order_usd:
+            logger.info("buy@%.2f skip: order $%.4f < min_order_usd $%.2f", level_price, usdc_max_usd, min_order_usd)
+            return False
         if usdc_max < 0.05 * 10 ** b.quote_decimals:
             logger.info("buy@%.2f skip: order too small", level_price)
             return False
-        logger.info("BUY base @ %.2f (swap %s USDC -> base)", level_price, usdc_max / 10 ** b.quote_decimals)
+        logger.info("BUY base @ %.2f (swap %s USDC -> base)", level_price, usdc_max_usd)
         # min_out anclado al NIVEL de grid esperado (no al quote vivo): si el pool
         # se movió y el precio real está >= 5-25% peor, la tx revierte en cadena en
         # lugar de comprar a precio de mercado. +1% de margen sobre el nivel (la
@@ -356,6 +363,13 @@ class LiveGridTrader:
         base_amt = min(self._order_size_base(total), base_bal)
         if base_amt < min_base:
             logger.info("sell@%.2f skip: order too small", level_price)
+            return False
+        # Idea Hummingbot (min_order_amount_quote): no vender cantidades tan
+        # pequeñas que las fees/gas se las coman.
+        min_order_usd = self.live_cfg.get("min_order_usd", 0.25)
+        sell_usd = base_amt / 10 ** b.base_decimals * self._last_price
+        if sell_usd < min_order_usd:
+            logger.info("sell@%.2f skip: order $%.4f < min_order_usd $%.2f", level_price, sell_usd, min_order_usd)
             return False
         logger.info("SELL base @ %.2f (swap %s base -> USDC)", level_price,
                     base_amt / 10 ** b.base_decimals)
