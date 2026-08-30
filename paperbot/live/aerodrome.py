@@ -440,10 +440,13 @@ class AerodromeLive:
                 self._quoter_contract = self.w3.eth.contract(address=self.quoter, abi=QUOTER_ABI)
                 # FIX (MEDIA): actualiza w3 del NonceManager para que
                 # resync_if_behind() consulte el RPC actual, no el anterior
+                # FIX C3: clear stale allowance cache — new RPC may have
+                # a different view of on-chain allowances.
+                self._approved_tokens.clear()
                 if self._nonce_manager is not None:
                     self._nonce_manager.update_w3(self.w3)
                     logger.info("NonceManager w3 updated to new RPC after switch")
-                logger.warning("switched RPC -> %s", url)
+                logger.warning("switched RPC -> %s (approved_tokens cache cleared)", url)
                 return True
         except Exception as e:
             logger.error("switch to %s failed: %s", url, e)

@@ -82,6 +82,16 @@ def read_meta():
     return out
 
 
+def _f(v, default=0.0):
+    """Convierte a float con tolerancia a None/'' (datos raros en DB)."""
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
 def read_trades(limit=15):
     """Últimos trades con estado: filled=1 -> OK, filled=0 -> REJ."""
     rows = []
@@ -94,8 +104,8 @@ def read_trades(limit=15):
             for r in cur.fetchall():
                 rows.append({
                     "id": r[0], "ts": parse_ts(r[1]), "side": r[2],
-                    "price": r[3], "size_usd": r[4], "fee_usd": r[5],
-                    "gas_usd": r[6], "filled": r[7], "tx": r[8],
+                    "price": _f(r[3]), "size_usd": _f(r[4]), "fee_usd": _f(r[5]),
+                    "gas_usd": _f(r[6]), "filled": r[7], "tx": r[8],
                 })
         finally:
             con.close()
@@ -236,6 +246,8 @@ def render():
     # ---- grid_state: último precio y pico dentro del JSON ----
     gs_price = gs.get("last_price")
     gs_peak = gs.get("peak_equity")
+    gs_price_f = _f(gs_price) if gs_price is not None else None
+    gs_peak_f = _f(gs_peak) if gs_peak is not None else None
 
     # ---- filas de trades ----
     tr_rows = ""
@@ -244,17 +256,18 @@ def render():
             st_emoji, st_txt, st_col = "✅", "OK", "#22c55e"
         else:
             st_emoji, st_txt, st_col = "❌", "REJ", "#ef4444"
-        side_emoji = "🔵" if t["side"] == "buy" else "🔴"
-        side_col = "#3b82f6" if t["side"] == "buy" else "#ef4444"
-        ts = t["ts"].strftime("%d/%m %H:%M:%S") if t["ts"] else t["id"]
+        side = (t["side"] or "?").lower()
+        side_emoji = "🔵" if side == "buy" else "🔴"
+        side_col = "#3b82f6" if side == "buy" else "#ef4444"
+        ts = t["ts"].strftime("%d/%m %H:%M:%S") if t["ts"] else (t["id"] if t["id"] is not None else "—")
         tx = (t["tx"] or "")[:10] + "…" if t["tx"] else "—"
         tr_rows += (
             f"<tr><td>{ts}</td>"
-            f"<td style='color:{side_col};font-weight:600'>{side_emoji} {t['side'].upper()}</td>"
-            f"<td>{t['price']:,.2f}</td>"
-            f"<td>${t['size_usd']:,.4f}</td>"
-            f"<td>${t['fee_usd']:,.4f}</td>"
-            f"<td>${t['gas_usd']:,.4f}</td>"
+            f"<td style='color:{side_col};font-weight:600'>{side_emoji} {side.upper()}</td>"
+            f"<td>{_f(t['price']):,.2f}</td>"
+            f"<td>${_f(t['size_usd']):,.4f}</td>"
+            f"<td>${_f(t['fee_usd']):,.4f}</td>"
+            f"<td>${_f(t['gas_usd']):,.4f}</td>"
             f"<td style='color:{st_col};font-weight:600'>{st_emoji} {st_txt}</td>"
             f"<td style='font-family:monospace;font-size:0.8em'>{tx}</td></tr>"
         )
@@ -288,6 +301,10 @@ def render():
 
     dd_color = "#22c55e" if dd <= 0.5 else ("#f59e0b" if dd <= 3 else "#ef4444")
     up_down = "🟢" if price >= (anchor or 0) else "🔻"
+    gs_price_txt = f"${gs_price_f:,.2f}" if gs_price_f is not None else "—"
+    gs_peak_txt = f"${gs_peak_f:,.4f}" if gs_peak_f is not None else "—"
+    anchor_txt = f"${anchor:,.2f}" if anchor is not None else "—"
+    spacing_txt = f"{spacing}%" if spacing is not None else "—"
 
     last_meta_ts = ""
     try:
@@ -323,13 +340,13 @@ def render():
 <table>
   <tr><th>Anchor</th><th>Spacing</th><th>Niveles compra</th><th>Niveles venta</th></tr>
   <tr>
-    <td style="font-weight:700;font-size:1.1em">${anchor:,.2f}</td>
-    <td>{spacing}%</td>
+    <td style="font-weight:700;font-size:1.1em">{anchor_txt}</td>
+    <td>{spacing_txt}</td>
     <td style="vertical-align:top"><table class="inner">{buy_rows}</table></td>
     <td style="vertical-align:top"><table class="inner">{sell_rows}</table></td>
   </tr>
 </table>
-<p class="sub">Último precio en grid_state: ${gs_price} · peak_equity grid: ${gs_peak:,.4f} · pool: <span style="font-family:monospace;font-size:0.85em">{gs.get('active_pool','—')}</span></p>
+<p class="sub">Último precio en grid_state: {gs_price_txt} · peak_equity grid: {gs_peak_txt} · pool: <span style="font-family:monospace;font-size:0.85em">{gs.get('active_pool','—')}</span></p>
 
 <h2>🕐 Últimos 15 trades</h2>
 <table>

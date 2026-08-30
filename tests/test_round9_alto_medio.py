@@ -23,6 +23,9 @@ class TestNonceWasteApprove:
         bot.router = "0x" + "a" * 40
         bot.chain_id = 8453
         bot.max_gas_gwei = 0.1
+        # Round 14 C3: ensure_approval now reads self._approved_tokens
+        # (a real set, initialized in __init__) — the mock must carry it too.
+        bot._approved_tokens = set()
 
         # Mock contract
         mock_contract = MagicMock()

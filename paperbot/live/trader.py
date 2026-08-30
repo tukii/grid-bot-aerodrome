@@ -308,6 +308,11 @@ class LiveGridTrader:
                 # If equity fetch fails, use a conservative cap (5% of max_spend)
                 step_usd = min(step_usd, self.max_spend_usd * 0.05)
                 logger.warning("equity fetch failed in order sizing; using conservative cap")
+        if not self._last_price or self._last_price <= 0:
+            # Sin precio (fetch falló o arranque sin tick): no podemos convertir
+            # USD -> base. Devolver 0 -> el caller skipea la orden (no revienta).
+            logger.warning("order sizing skipped: no valid price (%.4f)", self._last_price)
+            return 0
         return int(step_usd / self._last_price * 10 ** self.bot.base_decimals)
 
     def _execute_buy(self, level_price: float, total: float = 0.0) -> bool:
@@ -410,6 +415,9 @@ class LiveGridTrader:
         if not unwound:
             logger.error("UNWIND FAILED after 3 attempts: still holding base token!")
             send_alert("🚨 UNWIND FALLÓ: aún con posición en el token. Revisión manual.")
+        # FIX C1: write halted=true BEFORE stopping so bot.py reads it on
+        # restart (systemd Restart=always) and exits without trading.
+        self.store.set_meta("halted", "true")
         self.running = False
         self.store.set_meta("status", "stopped")
 
