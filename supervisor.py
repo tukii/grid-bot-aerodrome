@@ -154,6 +154,24 @@ def reanchor_config(new_anchor: float, reason: str, state: dict | None = None) -
 
     Hace backup antes. Nunca toca otras claves.
     """
+    # GUARD DE SEGURIDAD: rechazar anchors absurdos (tests, bugs, datos corruptos).
+    # El anchor debe estar dentro de [0.5x, 1.5x] del último precio on-chain;
+    # un valor como 3500 con precio 2500 es un error y NO debe tocar producción
+    # (causó un crash-loop de 2272 reinicios el 30-08).
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+        row = con.execute("SELECT value FROM meta WHERE key='last_price'").fetchone()
+        con.close()
+        if row:
+            last_price = float(row[0])
+            ratio = new_anchor / last_price if last_price else 0
+            if ratio < 0.5 or ratio > 1.5:
+                log.error("REANCHOR RECHAZADO: anchor %.2f fuera de rango [%.2f, %.2f] vs precio %.2f (%s)",
+                          new_anchor, last_price * 0.5, last_price * 1.5, last_price, reason)
+                return False
+    except Exception as e:
+        log.warning("guard de anchor no disponible (%s); continúo", e)
     if not CONFIG.exists():
         log.error("config.yaml no existe")
         return False
