@@ -226,10 +226,6 @@ class NonceManager:
         if self._nonce is not None and chain > self._nonce:
             self._nonce = chain
 
-    def update_w3(self, new_w3):
-        """Update w3 reference after RPC switch (fix MEDIA: _switch_rpc)."""
-        self.w3 = new_w3
-
 
 class AerodromeLive:
     def __init__(self, rpc_url: str | None = None):
@@ -318,21 +314,11 @@ class AerodromeLive:
         Si el NonceManager aún no existe (o la cuenta cambió, p.ej. rotación
         de activo) lo crea. Si la instancia previa quedó vinculada a otra
         cuenta, se descarta para no reutilizar nonces de otra wallet.
-
-        FIX (MEDIA): en la primera creación, sincroniza el nonce desde la
-        chain y lo informa en log para facilitar diagnóstico.
         """
         addr = Web3.to_checksum_address(account.address)
         if self._nonce_manager is None or self._nonce_manager_addr != addr:
             self._nonce_manager = NonceManager(self.w3, addr)
             self._nonce_manager_addr = addr
-            # Sincronizar y logear nonce al arrancar (diagnóstico)
-            try:
-                self._nonce_manager.sync()
-                logger.info("NonceManager init — nonce detected for %s: %d",
-                            addr, self._nonce_manager._nonce)
-            except Exception as e:
-                logger.warning("NonceManager init sync failed: %s", e)
         return self._nonce_manager
 
     # ---- security verification (cached 5 min) ----
@@ -438,11 +424,6 @@ class AerodromeLive:
                 self.w3 = w3f
                 self._router_contract = self.w3.eth.contract(address=self.router, abi=SWAP_ROUTER_ABI)
                 self._quoter_contract = self.w3.eth.contract(address=self.quoter, abi=QUOTER_ABI)
-                # FIX (MEDIA): actualiza w3 del NonceManager para que
-                # resync_if_behind() consulte el RPC actual, no el anterior
-                if self._nonce_manager is not None:
-                    self._nonce_manager.update_w3(self.w3)
-                    logger.info("NonceManager w3 updated to new RPC after switch")
                 logger.warning("switched RPC -> %s", url)
                 return True
         except Exception as e:
@@ -516,11 +497,6 @@ class AerodromeLive:
         gp = self.w3.eth.gas_price
         cap = int(self.max_gas_gwei * 1e9)
         if self.max_gas_gwei > 0 and gp > cap:
-            logger.warning(
-                "GAS CAP ABORT: network gas %.4f gwei exceeds cap %.4f gwei "
-                "— transaction will NOT be sent",
-                gp / 1e9, self.max_gas_gwei
-            )
             raise RuntimeError(
                 f"network gas {gp / 1e9:.4f} gwei > cap {self.max_gas_gwei:.4f} gwei — "
                 f"aborting tx to avoid underpriced failure"
