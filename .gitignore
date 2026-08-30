@@ -22,6 +22,7 @@ config.yaml
 # Backups de código
 *.bak.*
 *.bak
+*.backup.*
 
 # Sistema
 .DS_Store
