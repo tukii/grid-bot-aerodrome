@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import html as html_mod
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -394,7 +395,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             html = render().encode("utf-8")
         except Exception as e:
-            html = (f"<h1>Error renderizando dashboard</h1><pre>{e}</pre>").encode("utf-8")
+            html = (f"<h1>Error renderizando dashboard</h1><pre>{html_mod.escape(str(e))}</pre>").encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")

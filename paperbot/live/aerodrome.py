@@ -220,7 +220,8 @@ class NonceManager:
     def resync_if_behind(self):
         try:
             chain = self.w3.eth.get_transaction_count(self.address, "pending")
-        except Exception:
+        except Exception as e:
+            logger.warning("NonceManager resync failed: %s", e)
             return
         if self._nonce is not None and chain > self._nonce:
             self._nonce = chain
@@ -267,6 +268,9 @@ class AerodromeLive:
         # hasta get_account, que requiere PRIVATE_KEY del .env).
         self._nonce_manager = None
         self._nonce_manager_addr = None
+        # MEDIO #2: cache of (token, account, router) for which infinite approve
+        # has been confirmed on-chain — avoids redundant allowance() RPC each swap.
+        self._approved_tokens: set[tuple[str, str, str]] = set()
 
     def _read_decimals(self):
         """Read decimals from chain; fall back to config values."""
@@ -379,6 +383,17 @@ class AerodromeLive:
                 logger.error("on-chain verify fallback failed: %s", e2)
             return False
 
+    def invalidate_verification_cache(self):
+        """Force re-verification of router/pool factory on next swap.
+
+        Call when pool config changes (e.g. asset rotation) so the cached
+        factory-match result is not reused against a different pool/factory.
+        BAJA #30 fix.
+        """
+        self._factory_verify_ok = False
+        self._factory_verify_ts = 0.0
+        logger.info("on-chain verification cache invalidated (config change)")
+
     # ---- quotes ----
     def quote_swap(self, token_in: str, amount_in_raw: int, token_out: str) -> int | None:
         token_in = Web3.to_checksum_address(token_in)
@@ -473,46 +488,54 @@ class AerodromeLive:
         return self._eip1559
 
     def _gas_price(self) -> int:
-        """Gas price capped by max_gas_gwei. Falls back to network gas price.
+        """Gas price — raises if network gas exceeds cap (fix BAJA).
 
-        EIP-1559 (fix BAJA): si la red lo soporta, devuelve el precio LEGACY
-        equivalente al cap (maxFeePerGas = cap, maxPriorityFeePerGas = 0.001
-        gwei) — las txs se construyen con maxFeePerGas/maxPriorityFeePerGas y
-        el VALIDADOR del cap aplica igual. Este método se mantiene para
-        compatibilidad (tests y rutas legacy).
+        When the network gas price exceeds max_gas_gwei, raising is safer than
+        silently sending at a price that will never be mined. The caller
+        (swap_exact_in, wrap_eth, etc.) catches RuntimeError and aborts the tx.
         """
         gp = self.w3.eth.gas_price
         cap = int(self.max_gas_gwei * 1e9)
         if self.max_gas_gwei > 0 and gp > cap:
-            logger.warning("gas price %.4f gwei > cap %.4f, using cap", gp / 1e9, self.max_gas_gwei)
-            return cap
+            raise RuntimeError(
+                f"network gas {gp / 1e9:.4f} gwei > cap {self.max_gas_gwei:.4f} gwei — "
+                f"aborting tx to avoid underpriced failure"
+            )
         return gp
 
     def _build_fee_params(self) -> dict:
-        """Parámetros de gas para build_transaction.
+        """Parámetros de gas para build_transaction (EIP-1559, fix BAJA).
 
-        EIP-1559 (fix BAJA) si la red lo soporta: usa maxFeePerGas (cap) y
-        maxPriorityFeePerGas (=0.001 gwei, razonable en Base). Así la tx NO
-        queda "underpriced" con gasPrice legacy cuando la red sube: el cap
-        de maxFeePerGas = self.max_gas_gwei es el límite estricto y el
-        minero puede reclamar hasta ese máximo sin que la tx muera lenta.
+        Si la red soporta maxFeePerGas (Base sí: baseFeePerGas en el bloque
+        "latest"), construye la tx con maxFeePerGas/maxPriorityFeePerGas en lugar
+        de gasPrice legacy. El cap configurado (live.max_gas_gwei) es el límite
+        ESTRICTO de maxFeePerGas — nunca se supera.
 
-        Seguridad:
-          - maxFeePerGas NUNCA supera el cap configurado (max_gas_gwei).
-          - maxPriorityFeePerGas se capea al mínimo(max_priority, maxFee).
-          - Si la red NO soporta EIP-1559 (baseFeePerGas ausente) -> gasPrice
-            legacy con el mismo cap (comportamiento anterior intacto).
+        Si base_fee > cap: aborta con RuntimeError (evita tx underpriced que
+        nunca será minada).
+
+        ALTO #4: si cap <= 0, raise ValueError (antes usaba gas_price sin cap,
+        lo cual podía enviar tx a precio de mercado sin límite).
+
+        Si la red NO soporta EIP-1559 -> gasPrice legacy con el mismo cap.
         """
         cap = int(self.max_gas_gwei * 1e9)
+        if cap <= 0:
+            raise ValueError(
+                f"max_gas_gwei must be > 0, got {self.max_gas_gwei} — "
+                f"refusing to build tx without gas cap"
+            )
         if self.eip1559_supported:
             base_fee = int(self.w3.eth.get_block("latest")["baseFeePerGas"])
+            if base_fee > cap:
+                raise RuntimeError(
+                    f"EIP-1559 baseFee {base_fee / 1e9:.4f} gwei > cap "
+                    f"{self.max_gas_gwei:.4f} gwei — aborting tx"
+                )
             tip = int(1e6)  # 0.001 gwei (Base: suficiente, base fee ~0.005 gwei)
             tip = min(tip, cap)
             max_fee = max(base_fee + tip, tip)
             max_fee = min(max_fee, cap)
-            if max_fee <= 0:
-                # Red sin precio (anomalía): usa legacy con cap como salvaguarda
-                return {"gasPrice": cap or self.w3.eth.gas_price}
             logger.debug("EIP-1559 fees: baseFee=%s tip=%s maxFee=%s (cap=%s)",
                          base_fee, tip, max_fee, cap)
             return {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": tip}
@@ -540,16 +563,49 @@ class AerodromeLive:
         Seguridad: el router está verificado on-chain (factory match); el approve
         infinito es el estándar en DeFi (Uniswap, Aerodrome, etc.).
 
+        MEDIO #2: tokens with infinite approve confirmed on-chain are cached
+        in self._approved_tokens — subsequent swaps skip the allowance() RPC.
+
         Returns ApprovalStatus.EXISTS / SENT / FAILED.
         """
         token = Web3.to_checksum_address(token)
+        account_addr = Web3.to_checksum_address(account.address)
+        cache_key = (token, account_addr, self.router)
+
+        # MEDIO #2: fast-path — if we already approved infinite for this
+        # (token, account, router) in this process, skip the allowance RPC.
+        if cache_key in self._approved_tokens:
+            return ApprovalStatus.EXISTS
+
         c = self.w3.eth.contract(address=token, abi=ERC20_ABI)
-        current = c.functions.allowance(account.address, self.router).call()
+        current = c.functions.allowance(account_addr, self.router).call()
+        MAX_UINT = (1 << 256) - 1
+        if current >= MAX_UINT:
+            self._approved_tokens.add(cache_key)
+            return ApprovalStatus.EXISTS
         if current >= amount_raw:
             return ApprovalStatus.EXISTS
         # Approve infinito si el allowance actual es < amount_raw
+        nonce_mgr = nonce_mgr or self.get_nonce_manager(account)
+        nonce_mgr.resync_if_behind()
+        # Try approve(MAX) directly first (saves 1 nonce when token allows it)
+        try:
+            tx = c.functions.approve(self.router, MAX_UINT).build_transaction({
+                "from": account.address,
+                "nonce": nonce_mgr.next(),
+                "gas": 60000,
+                **_build_fee_params(self),
+                "chainId": self.chain_id,
+            })
+            tx["gas"] = self._estimate_gas(tx)
+            ok, _, _ = self._send(tx, account, "approve", nonce_mgr=nonce_mgr)
+            if ok:
+                self._approved_tokens.add(cache_key)
+                return ApprovalStatus.SENT
+        except Exception as e:
+            logger.warning("direct approve(MAX) failed: %s; trying reset+approve", e)
+        # Fallback: approve(0) then approve(MAX) for tokens that require reset
         if current > 0:
-            # Primero a 0 (requerido por algunos tokens), luego a máx
             try:
                 tx0 = c.functions.approve(self.router, 0).build_transaction({
                     "from": account.address,
@@ -562,8 +618,6 @@ class AerodromeLive:
                 self._send(tx0, account, "approve_reset", nonce_mgr=nonce_mgr)
             except Exception as e:
                 logger.warning("approve reset a 0 falló (no crítico): %s", e)
-        MAX_UINT = (1 << 256) - 1
-        nonce_mgr = nonce_mgr or self.get_nonce_manager(account)
         nonce_mgr.resync_if_behind()
         tx = c.functions.approve(self.router, MAX_UINT).build_transaction({
             "from": account.address,
@@ -574,6 +628,8 @@ class AerodromeLive:
         })
         tx["gas"] = self._estimate_gas(tx)
         ok, _, _ = self._send(tx, account, "approve", nonce_mgr=nonce_mgr)
+        if ok:
+            self._approved_tokens.add(cache_key)
         return ApprovalStatus.SENT if ok else ApprovalStatus.FAILED
 
     # ---- swap ----

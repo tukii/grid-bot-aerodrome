@@ -259,7 +259,7 @@ class LiveGridTrader:
                 del self._orders[p]
         for p, side in list(self._orders.items()):
             if side == "buy" and p >= price:
-                filled = self._execute_buy(p)
+                filled = self._execute_buy(p, total=total)
                 if filled:
                     del self._orders[p]
                     self._orders[round(p * (1 + step), 8)] = "sell"
@@ -269,7 +269,7 @@ class LiveGridTrader:
         # trigger pending sells
         for p, side in list(self._orders.items()):
             if side == "sell" and p <= price:
-                filled = self._execute_sell(p)
+                filled = self._execute_sell(p, total=total)
                 if filled:
                     del self._orders[p]
                     self._orders[round(p / (1 + step), 8)] = "buy"
@@ -280,36 +280,43 @@ class LiveGridTrader:
         return {"ok": True, "price": price, "total": total}
 
     # ---- order execution ----
-    def _order_size_base(self) -> int:
+    def _order_size_base(self, total: float = 0.0) -> int:
         """Grid increment sized to min(available capital, grid increment).
 
         SECURITY: cap per-order size at 15% of current total equity AND at
         max_spend_usd/n, whichever is smaller. Prevents oversized orders when
         max_spend_usd is set larger than real capital.
+
+        ALTO #1: 'total' is passed from one_cycle() to avoid re-fetching
+        _usd_value() which would waste 3 RPCs per order.
         """
         n = len(self.grid.levels)
         step_usd = self.max_spend_usd / n
         step_usd = min(step_usd, self.max_spend_usd * 0.25)
         # Hard cap: never more than 15% of current total equity per order
-        try:
-            _, _, total = _usd_value(self.bot, self.account)
-            if total > 0:
-                step_usd = min(step_usd, total * 0.15)
-            else:
+        if total > 0:
+            step_usd = min(step_usd, total * 0.15)
+        else:
+            # Fallback: if caller did not provide total, fetch it (legacy path)
+            try:
+                _, _, total = _usd_value(self.bot, self.account)
+                if total > 0:
+                    step_usd = min(step_usd, total * 0.15)
+                else:
+                    step_usd = min(step_usd, self.max_spend_usd * 0.05)
+            except Exception:
+                # If equity fetch fails, use a conservative cap (5% of max_spend)
                 step_usd = min(step_usd, self.max_spend_usd * 0.05)
-        except Exception:
-            # If equity fetch fails, use a conservative cap (5% of max_spend)
-            step_usd = min(step_usd, self.max_spend_usd * 0.05)
-            logger.warning("equity fetch failed in order sizing; using conservative cap")
+                logger.warning("equity fetch failed in order sizing; using conservative cap")
         return int(step_usd / self._last_price * 10 ** self.bot.base_decimals)
 
-    def _execute_buy(self, level_price: float) -> bool:
+    def _execute_buy(self, level_price: float, total: float = 0.0) -> bool:
         b = self.bot
         usdc_bal = b.token_balance(b.usdc, self.account.address) / 10 ** b.quote_decimals
         if usdc_bal < 0.05:
             logger.info("buy@%.2f skip: insufficient USDC (%.4f)", level_price, usdc_bal)
             return False
-        base_need = self._order_size_base()
+        base_need = self._order_size_base(total)
         usdc_needed_raw = int(base_need * level_price / 10 ** b.base_decimals * 10 ** b.quote_decimals)
         usdc_max = min(usdc_needed_raw, b.token_balance(b.usdc, self.account.address))
         if usdc_max < 0.05 * 10 ** b.quote_decimals:
@@ -334,14 +341,14 @@ class LiveGridTrader:
             send_alert(f"🔴 FALLO COMPRA @ ${level_price:.2f}: {r.message}")
         return filled
 
-    def _execute_sell(self, level_price: float) -> bool:
+    def _execute_sell(self, level_price: float, total: float = 0.0) -> bool:
         b = self.bot
         min_base = 0.05 / self._last_price * 10 ** b.base_decimals
         base_bal = b.token_balance(b.base_token, self.account.address)
         if base_bal < min_base:
             logger.info("sell@%.2f skip: insufficient base", level_price)
             return False
-        base_amt = min(self._order_size_base(), base_bal)
+        base_amt = min(self._order_size_base(total), base_bal)
         if base_amt < min_base:
             logger.info("sell@%.2f skip: order too small", level_price)
             return False
@@ -472,22 +479,24 @@ class LiveGridTrader:
                     self.cfg["pool"]["base_token"])
         if base_bal > 0:
             r = b.swap_exact_in(b.base_token, b.usdc, base_bal,
-                                account=self.account, dry_run=False)
+                                account=self.account, dry_run=self.dry_run)
             logger.info("migrate sell result: %s", r.message)
             send_alert(f"🔄 Venta {self.cfg['pool']['base_token']} → USDC: {r.message}")
             if not (r.ok and r.receipt_status == 1):
                 logger.error("MIGRATE aborted: exit trade failed")
                 return
 
-        self._update_pool_config(cand)
-        # Invalidate USD cache on pool change
+        # Invalidate USD cache BEFORE pool config change to prevent stale price
         global USD_PER_BASE
         USD_PER_BASE = None
+
+        self._update_pool_config(cand)
 
         self.cfg = load_config()
         self.live_cfg = self.cfg["live"]
         self.grid_cfg = self.cfg["grid"]
         self.bot = AerodromeLive()
+        self.bot.invalidate_verification_cache()  # BAJA #30: force re-verify for new pool
         self.account = self.bot.get_account()
         self.store.set_meta("active_asset", cand.symbol)
         self.store.set_meta("active_pool", cand.pool_address)

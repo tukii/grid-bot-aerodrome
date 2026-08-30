@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -16,7 +17,24 @@ class Store:
         self.db_path = db_path
         self._conn = sqlite3.connect(db_path)
         self._conn.row_factory = sqlite3.Row
-        self._init()
+        try:
+            # Fix round 9: WAL mode — permite lecturas concurrentes sin bloqueo
+            # (supervisor.py lee live.db en modo ro mientras el bot escribe)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._init()
+        except sqlite3.DatabaseError:
+            # DB corrupta por crash previo: renombrar a .corrupt.{ts} y crear nueva
+            import time as _time
+            corrupt_name = f"{db_path}.corrupt.{int(_time.time())}"
+            self._conn.close()
+            try:
+                os.rename(db_path, corrupt_name)
+            except OSError:
+                pass
+            self._conn = sqlite3.connect(db_path)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._init()
 
     def _init(self):
         with self._conn:

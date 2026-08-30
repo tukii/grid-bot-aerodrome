@@ -134,31 +134,20 @@ def halt_bot(reason: str) -> bool:
 
 
 def read_config() -> dict:
-    """Parse ligero del YAML (solo las claves que nos interesan)."""
-    cfg = {}
-    section = None
-    for line in CONFIG.read_text().splitlines():
-        line = line.rstrip()
-        if not line or line.startswith("#"):
-            continue
-        if not line.startswith(" ") and line.endswith(":"):
-            section = line[:-1].strip()
-            cfg[section] = {}
-            continue
-        if line.lstrip().startswith("telegram_bot_token:"):
-            # El valor puede ser '' (string vacío, config sin token tras el fix
-            # BAJA): el parser genérico lo dejaría como "''" (falsy pero sucio);
-            # lo normalizamos a cadena limpia o ''.
-            v = line.partition(":")[2].strip().strip("'").strip('"').strip()
-            cfg[section]["telegram_bot_token"] = "" if v in ("", "''", '""') else v
-            continue
-        if ":" in line and section:
-            k, _, v = line.partition(":")
-            cfg[section][k.strip()] = v.strip()
-    return cfg
+    """Parse robusto del YAML usando yaml.safe_load()."""
+    import yaml
+    try:
+        with open(CONFIG, "r") as f:
+            cfg = yaml.safe_load(f)
+        if not isinstance(cfg, dict):
+            return {}
+        return cfg
+    except Exception as e:
+        log.error("YAML parse failed: %s", e)
+        return {}
 
 
-def reanchor_config(new_anchor: float, reason: str) -> bool:
+def reanchor_config(new_anchor: float, reason: str, state: dict | None = None) -> bool:
     """Re-ancla config.yaml: actualiza anchor_price y reinicia el bot.
 
     Hace backup antes. Nunca toca otras claves.
@@ -187,8 +176,11 @@ def reanchor_config(new_anchor: float, reason: str) -> bool:
     if not changed:
         log.error("no encontré anchor_price en config.yaml")
         return False
-    CONFIG.write_text("\n".join(out) + "\n")
-    log_action(None, "config_anchor_update", f"{new_anchor} ({reason})")
+    # Fix round 9: escritura atómica — primero a .tmp, luego rename
+    tmp_path = CONFIG.with_suffix(".yaml.tmp")
+    tmp_path.write_text("\n".join(out) + "\n")
+    os.rename(str(tmp_path), str(CONFIG))
+    log_action(state, "config_anchor_update", f"{new_anchor} ({reason})")
     # CRÍTICO: invalidar el grid_state persistido en la DB para que el bot NO cargue
     # el grid viejo (órdenes fantasma). El bot reconstruirá el grid desde el nuevo anchor.
     try:
@@ -288,6 +280,13 @@ def main_loop():
 
     while True:
         try:
+            # 0. ¿Está halted? Si el bot fue parado por stop-loss, no reiniciar.
+            halted = read_meta("halted")
+            if halted and halted.strip().lower() in ("1", "true", "yes"):
+                log.info("halted=true en DB -> supervisor no reinicia el bot")
+                time.sleep(60)
+                continue
+
             # 1. ¿Está vivo el servicio?
             if not service_alive():
                 log.warning("grid-bot.service NO activo -> reiniciando")
@@ -343,7 +342,7 @@ def main_loop():
                         log.info("drift %.2f%% > reanchor %.1f%% -> re-anclar a $%.2f", drift, reanchor_pct, price)
                         log_action(state, "reanchor", f"drift {drift:.2f}% -> ${price:.2f}")
                         state["last_reanchor_ts"] = time.time()
-                        ok = reanchor_config(price, f"drift {drift:.2f}%")
+                        ok = reanchor_config(price, f"drift {drift:.2f}%", state=state)
                         send_telegram(f"🔄 Re-anchor grid a ${price:.2f} (drift {drift:.1f}%)")
                         state["last_reanchor_ts"] = time.time() if ok else state.get("last_reanchor_ts", 0)
                     else:
@@ -357,18 +356,24 @@ def main_loop():
                         if buys and sells and price:
                             lowest_sell = min(sells)
                             highest_buy = max(buys)
-                            # Solo re-anclar si el precio está FUERA del rango [mayor buy, menor sell]
-                            if price > lowest_sell * 1.02 or price < highest_buy * 0.98:
-                                if cooldown > 3600 * 6:  # 6h mínimo, no cada hora
-                                    log.info("precio $%.2f fuera del rango del grid [%.2f, %.2f] -> re-anclar",
-                                             price, highest_buy, lowest_sell)
-                                    log_action(state, "reanchor_out_of_range",
-                                               f"price {price} fuera de [{highest_buy}, {lowest_sell}]")
-                                    state["last_reanchor_ts"] = time.time()
-                                    ok = reanchor_config(price, "precio fuera del rango del grid")
-                                    send_telegram(f"🔄 Re-anchor (precio fuera de rango) a ${price:.2f}")
+                            # PRINCIPIO DGT (arXiv 2506.11921): cuando el precio cruza el
+                            # límite del grid, re-anclar al precio actual como nuevo centro
+                            # en vez de dejar que el grid "termine" y pierda la tendencia.
+                            # El paper demuestra que esto da IRR 60-70% con MDD mucho menor
+                            # que el grid tradicional (que tiene esperanza matemática CERO).
+                            crossed_upper = price >= lowest_sell
+                            crossed_lower = price <= highest_buy
+                            if (crossed_upper or crossed_lower) and cooldown > 1800:  # 30 min
+                                dir_str = "superior (rally)" if crossed_upper else "inferior (caída)"
+                                log.info("DGT: precio $%.2f cruzó límite %s del grid [%.2f, %.2f] -> re-anclar",
+                                         price, dir_str, highest_buy, lowest_sell)
+                                log_action(state, "reanchor_dgt",
+                                           f"price {price} cruzó {dir_str} [{highest_buy}, {lowest_sell}]")
+                                state["last_reanchor_ts"] = time.time()
+                                ok = reanchor_config(price, f"DGT cruce {dir_str}", state=state)
+                                send_telegram(f"🔄 DGT: re-anchor a ${price:.2f} (cruce {dir_str})")
                             else:
-                                log.info("precio $%.2f DENTRO del rango del grid [%.2f, %.2f] -> sin re-anclar",
+                                log.info("precio $%.2f dentro del rango [%.2f, %.2f] -> sin re-anclar",
                                          price, highest_buy, lowest_sell)
 
             # 4. Persistir estado y dormir
