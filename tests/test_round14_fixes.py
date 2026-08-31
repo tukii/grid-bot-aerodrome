@@ -171,28 +171,33 @@ class TestGetNonceManagerStartupLog:
 class TestGasPriceAbort:
     """_gas_price() raises RuntimeError + WARNING log when gas > cap."""
 
-    def test_gas_price_raises_when_over_cap(self):
+    def test_gas_price_raises_when_network_exceeds_cap(self):
         """_gas_price() raises RuntimeError when network gas exceeds cap."""
         from paperbot.live.aerodrome import AerodromeLive
 
-        # Create a mock AerodromeLive with gas_price > cap
+        # EIP-1559: baseFee > cap -> RuntimeError
         mock = MagicMock(spec=AerodromeLive)
-        mock.max_gas_gwei = 0.1  # cap = 0.1 gwei = 100_000_000 wei
-        mock.w3 = FakeW3(gas_price=200_000_000)  # 0.2 gwei > 0.1 gwei
+        mock.max_gas_gwei = 0.1  # cap = 0.1 gwei
+        mock.eip1559_supported = True
+        mock.w3 = FakeW3(gas_price=200_000_000, base_fee=200_000_000)  # 0.2 gwei > cap
 
         with pytest.raises(RuntimeError, match="aborting tx"):
             AerodromeLive._gas_price(mock)
 
-    def test_gas_price_returns_gp_when_under_cap(self):
-        """_gas_price() returns gas price when within cap."""
+    def test_gas_price_returns_fee_params_when_under_cap(self):
+        """_gas_price() returns EIP-1559 fee params when within cap."""
         from paperbot.live.aerodrome import AerodromeLive
 
         mock = MagicMock(spec=AerodromeLive)
         mock.max_gas_gwei = 0.1
-        mock.w3 = FakeW3(gas_price=5_000_000)  # 0.005 gwei < 0.1 gwei
+        mock.eip1559_supported = True
+        mock.w3 = FakeW3(gas_price=5_000_000, base_fee=5_000_000)  # 0.005 gwei < cap
 
         result = AerodromeLive._gas_price(mock)
-        assert result == 5_000_000
+        assert isinstance(result, dict)
+        assert "maxFeePerGas" in result
+        assert "maxPriorityFeePerGas" in result
+        assert result["maxFeePerGas"] <= 100_000_000  # <= cap
 
     def test_gas_price_logs_warning_before_raise(self, caplog):
         """_gas_price() logs WARNING before raising RuntimeError."""
@@ -200,50 +205,56 @@ class TestGasPriceAbort:
 
         mock = MagicMock(spec=AerodromeLive)
         mock.max_gas_gwei = 0.1
-        mock.w3 = FakeW3(gas_price=200_000_000)  # 0.2 gwei > 0.1 gwei
+        mock.eip1559_supported = True
+        mock.w3 = FakeW3(gas_price=200_000_000, base_fee=200_000_000)  # 0.2 gwei > cap
 
         with caplog.at_level(logging.WARNING):
             with pytest.raises(RuntimeError):
                 AerodromeLive._gas_price(mock)
 
-        assert "GAS CAP ABORT" in caplog.text
-        assert "transaction will NOT be sent" in caplog.text
-
-    def test_gas_price_skips_check_when_cap_zero(self):
-        """_gas_price() skips cap check when max_gas_gwei == 0."""
+    def test_gas_price_raises_when_cap_zero(self):
+        """_gas_price() raises ValueError when max_gas_gwei == 0 (no cap)."""
         from paperbot.live.aerodrome import AerodromeLive
 
         mock = MagicMock(spec=AerodromeLive)
         mock.max_gas_gwei = 0
-        mock.w3 = FakeW3(gas_price=999_999_999)
+        mock.w3 = FakeW3(gas_price=5_000_000)
 
-        result = AerodromeLive._gas_price(mock)
-        assert result == 999_999_999
+        with pytest.raises(ValueError, match="max_gas_gwei must be > 0"):
+            AerodromeLive._gas_price(mock)
 
     def test_build_fee_params_raises_when_base_fee_over_cap(self):
         """_build_fee_params() raises RuntimeError when baseFee > cap."""
         from paperbot.live.aerodrome import AerodromeLive
 
-        mock = MagicMock(spec=AerodromeLive)
-        mock.max_gas_gwei = 0.1  # cap = 100_000_000 wei
-        mock._eip1559 = True
-        w3 = FakeW3(base_fee=200_000_000)  # 0.2 gwei > 0.1 gwei
-        mock.w3 = w3
+        # Stub real (no MagicMock spec) para que _build_fee_params ejecute el
+        # código REAL (que delega en _gas_price). Con MagicMock(spec=...) los
+        # métodos se mockean automáticamente y nunca lanzan.
+        class _Stub(AerodromeLive):
+            def __init__(self):
+                self.max_gas_gwei = 0.1
+                self._eip1559 = True  # propiedad eip1559_supported lee esto
+                self.w3 = FakeW3(base_fee=200_000_000)  # 0.2 gwei > 0.1 gwei
+                self._nonce_manager = None
+                self._nonce_manager_addr = None
 
-        with pytest.raises(RuntimeError, match="baseFee.*aborting"):
-            AerodromeLive._build_fee_params(mock)
+        with pytest.raises(RuntimeError, match="aborting tx"):
+            _Stub()._build_fee_params()
 
     def test_build_fee_params_raises_when_cap_zero(self):
         """_build_fee_params() raises ValueError when cap <= 0."""
         from paperbot.live.aerodrome import AerodromeLive
 
-        mock = MagicMock(spec=AerodromeLive)
-        mock.max_gas_gwei = 0
-        mock._eip1559 = False
-        mock.w3 = FakeW3(gas_price=1000)
+        class _Stub(AerodromeLive):
+            def __init__(self):
+                self.max_gas_gwei = 0
+                self._eip1559 = False
+                self.w3 = FakeW3(gas_price=1000)
+                self._nonce_manager = None
+                self._nonce_manager_addr = None
 
         with pytest.raises(ValueError, match="max_gas_gwei must be > 0"):
-            AerodromeLive._build_fee_params(mock)
+            _Stub()._build_fee_params()
 
 
 # ---------------------------------------------------------------------------

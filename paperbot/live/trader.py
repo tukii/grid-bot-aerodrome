@@ -259,7 +259,16 @@ class LiveGridTrader:
                 del self._orders[p]
         for p, side in list(self._orders.items()):
             if side == "buy" and p >= price:
-                filled = self._execute_buy(p, total=total)
+                try:
+                    filled = self._execute_buy(p, total=total)
+                except RuntimeError as e:
+                    # FIX G1: gas cap abortó el trade — registrar y continuar
+                    logger.warning("BUY@%.2f skipped (gas cap): %s", p, e)
+                    self.store.set_meta(
+                        "gas_skip_count",
+                        str(int(self.store.get_meta("gas_skip_count") or 0) + 1),
+                    )
+                    filled = False
                 if filled:
                     del self._orders[p]
                     self._orders[round(p * (1 + step), 8)] = "sell"
@@ -269,7 +278,16 @@ class LiveGridTrader:
         # trigger pending sells
         for p, side in list(self._orders.items()):
             if side == "sell" and p <= price:
-                filled = self._execute_sell(p, total=total)
+                try:
+                    filled = self._execute_sell(p, total=total)
+                except RuntimeError as e:
+                    # FIX G1: gas cap abortó el trade — registrar y continuar
+                    logger.warning("SELL@%.2f skipped (gas cap): %s", p, e)
+                    self.store.set_meta(
+                        "gas_skip_count",
+                        str(int(self.store.get_meta("gas_skip_count") or 0) + 1),
+                    )
+                    filled = False
                 if filled:
                     del self._orders[p]
                     self._orders[round(p / (1 + step), 8)] = "buy"
@@ -317,13 +335,15 @@ class LiveGridTrader:
 
     def _execute_buy(self, level_price: float, total: float = 0.0) -> bool:
         b = self.bot
-        usdc_bal = b.token_balance(b.usdc, self.account.address) / 10 ** b.quote_decimals
+        usdc_bal_raw = b.token_balance(b.usdc, self.account.address)
+        usdc_bal = usdc_bal_raw / 10 ** b.quote_decimals
         if usdc_bal < 0.05:
             logger.info("buy@%.2f skip: insufficient USDC (%.4f)", level_price, usdc_bal)
             return False
         base_need = self._order_size_base(total)
         usdc_needed_raw = int(base_need * level_price / 10 ** b.base_decimals * 10 ** b.quote_decimals)
-        usdc_max = min(usdc_needed_raw, b.token_balance(b.usdc, self.account.address))
+        # FIX BAJA #6: reuse usdc_bal_raw instead of second RPC call
+        usdc_max = min(usdc_needed_raw, usdc_bal_raw)
         usdc_max_usd = usdc_max / 10 ** b.quote_decimals
         # Idea Hummingbot (min_order_amount_quote): no ejecutar órdenes tan pequeñas
         # que las fees/gas se las coman. Umbral configurable (min_order_usd).
@@ -432,6 +452,8 @@ class LiveGridTrader:
         # FIX C1: write halted=true BEFORE stopping so bot.py reads it on
         # restart (systemd Restart=always) and exits without trading.
         self.store.set_meta("halted", "true")
+        # FIX N10: limpiar órdenes pendientes para evitar re-ejecución al reiniciar
+        self._orders.clear()
         self.running = False
         self.store.set_meta("status", "stopped")
 

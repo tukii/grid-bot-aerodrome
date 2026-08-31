@@ -62,6 +62,11 @@ class PaperTrader:
             self.store.set_meta(f"fill_{trade_key}", "1")
         self.store.set_meta("filled_count", str(len(fills)))
 
+        # FIX BAJA #4: periodic cleanup of old fill_* meta keys.
+        # Without this, fill_* keys accumulate indefinitely in the meta table
+        # (one per simulated fill, ~720/day at 5min poll). Keep last 100.
+        self._cleanup_old_fills()
+
         last = self.engine.history[-1]
         self.store.record_tick(
             ts=last.timestamp, price=last.price, side="",
@@ -85,3 +90,33 @@ class PaperTrader:
             except Exception as e:
                 logger.exception("cycle error: %s", e)
             time.sleep(self.poll_seconds)
+
+    def _cleanup_old_fills(self):
+        """Remove oldest fill_* meta keys, keeping the last 100.
+
+        FIX BAJA #4: fill_* keys accumulate one per simulated fill (~720/day
+        at 5min poll). Without cleanup the meta table grows unbounded.
+        """
+        try:
+            import sqlite3
+            db_path = self.store.db_path
+            if not db_path or not __import__("pathlib").Path(db_path).exists():
+                return
+            con = sqlite3.connect(str(db_path), timeout=5)
+            rows = con.execute(
+                "SELECT key FROM meta WHERE key LIKE 'fill_%' ORDER BY rowid"
+            ).fetchall()
+            con.close()
+            if len(rows) <= 100:
+                return
+            to_delete = [r[0] for r in rows[: len(rows) - 100]]
+            con = sqlite3.connect(str(db_path), timeout=5)
+            con.executemany(
+                "DELETE FROM meta WHERE key = ?",
+                [(k,) for k in to_delete],
+            )
+            con.commit()
+            con.close()
+            logger.debug("cleaned %d old fill_* meta keys", len(to_delete))
+        except Exception as e:
+            logger.debug("fill cleanup failed (non-fatal): %s", e)

@@ -324,7 +324,9 @@ def send_telegram(msg: str):
 def get_onchain_snapshot():
     """Lee balances reales on-chain vía el propio bot (sin escribir)."""
     try:
-        sys.path.insert(0, str(BASE))
+        # FIX BAJA #5: guard against duplicate sys.path entries on repeated calls
+        if str(BASE) not in sys.path:
+            sys.path.insert(0, str(BASE))
         from paperbot.live.aerodrome import AerodromeLive
         bot = AerodromeLive()
         acc = bot.get_account()
@@ -448,16 +450,19 @@ def main_loop():
                             lowest_sell = min(sells)
                             highest_buy = max(buys)
                             # PRINCIPIO DGT (arXiv 2506.11921): cuando el precio cruza el
-                            # límite del grid, re-anclar al precio actual como nuevo centro
-                            # en vez de dejar que el grid "termine" y pierda la tendencia.
-                            # El paper demuestra que esto da IRR 60-70% con MDD mucho menor
-                            # que el grid tradicional (que tiene esperanza matemática CERO).
-                            crossed_upper = price >= lowest_sell
-                            crossed_lower = price <= highest_buy
+                            # límite EXTERNO del grid (el último nivel del rango, no el
+                            # primero), re-anclar al precio actual como nuevo centro.
+                            # Antes re-anclaba al cruzar el PRIMER nivel (±spacing), lo que
+                            # reiniciaba el grid constantemente y pisoteaba las rotaciones
+                            # compra->venta (5 compras, 0 ventas en WETH/USDC).
+                            outer_upper = max(sells)
+                            outer_lower = min(buys)
+                            crossed_upper = price >= outer_upper
+                            crossed_lower = price <= outer_lower
                             if (crossed_upper or crossed_lower) and cooldown > 1800 and not _dgt_done:  # 30 min
                                 dir_str = "superior (rally)" if crossed_upper else "inferior (caída)"
-                                log.info("DGT: precio $%.2f cruzó límite %s del grid [%.2f, %.2f] -> re-anclar",
-                                         price, dir_str, highest_buy, lowest_sell)
+                                log.info("DGT: precio $%.2f cruzó límite externo %s [%.2f, %.2f] -> re-anclar",
+                                         price, dir_str, outer_lower, outer_upper)
                                 log_action(state, "reanchor_dgt",
                                            f"price {price} cruzó {dir_str} [{highest_buy}, {lowest_sell}]")
                                 state["last_reanchor_ts"] = time.time()

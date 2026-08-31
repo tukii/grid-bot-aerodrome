@@ -281,76 +281,79 @@ class TestGasEIP1559:
 
         bot = MagicMock(spec=AerodromeLive)
         bot.max_gas_gwei = 0.1  # 0.1 gwei cap
+        bot.eip1559_supported = True
 
-        # Mock gas_price to return 0.5 gwei (way above cap)
         mock_w3 = MagicMock()
-        mock_w3.eth.gas_price = int(0.5 * 1e9)  # 0.5 gwei
+        mock_w3.eth.get_block.return_value = {"baseFeePerGas": int(0.5 * 1e9)}  # 0.5 gwei
         bot.w3 = mock_w3
 
-        with pytest.raises(RuntimeError, match="network gas.*gwei > cap.*aborting"):
+        with pytest.raises(RuntimeError, match="aborting tx"):
             AerodromeLive._gas_price(bot)
 
     def test_gas_price_normal_when_below_cap(self):
-        """_gas_price() returns normal gas when below cap."""
+        """_gas_price() returns EIP-1559 params when below cap."""
         from paperbot.live.aerodrome import AerodromeLive
 
         bot = MagicMock(spec=AerodromeLive)
         bot.max_gas_gwei = 1.0  # 1 gwei cap
+        bot.eip1559_supported = True
 
         mock_w3 = MagicMock()
-        mock_w3.eth.gas_price = int(0.005 * 1e9)  # 0.005 gwei
+        mock_w3.eth.get_block.return_value = {"baseFeePerGas": int(0.005 * 1e9)}  # 0.005 gwei
         bot.w3 = mock_w3
 
         result = AerodromeLive._gas_price(bot)
-        assert result == int(0.005 * 1e9)
+        assert isinstance(result, dict)
+        assert result["maxFeePerGas"] <= int(1.0 * 1e9)
 
-    def test_gas_price_normal_when_zero_cap(self):
-        """_gas_price() returns network gas when cap is 0 (disabled)."""
+    def test_gas_price_raises_when_cap_zero(self):
+        """_gas_price() raises ValueError when cap is 0 (no safety cap)."""
         from paperbot.live.aerodrome import AerodromeLive
 
         bot = MagicMock(spec=AerodromeLive)
-        bot.max_gas_gwei = 0  # disabled
+        bot.max_gas_gwei = 0  # disabled — ahora rechazado
 
         mock_w3 = MagicMock()
-        mock_w3.eth.gas_price = int(1.0 * 1e9)  # 1 gwei
         bot.w3 = mock_w3
 
-        result = AerodromeLive._gas_price(bot)
-        assert result == int(1.0 * 1e9)
+        with pytest.raises(ValueError, match="max_gas_gwei must be > 0"):
+            AerodromeLive._gas_price(bot)
 
     def test_build_fee_params_raises_when_basefee_above_cap(self):
         """_build_fee_params must raise RuntimeError when baseFee > cap (EIP-1559)."""
         from paperbot.live.aerodrome import AerodromeLive
 
-        bot = MagicMock(spec=AerodromeLive)
-        bot.max_gas_gwei = 0.1  # 0.1 gwei cap
-        bot._eip1559 = True
+        # Stub real (no MagicMock) para que _build_fee_params ejecute el código
+        # real (delega en _gas_price). Con MagicMock(spec=...) los métodos se
+        # mockean y nunca lanzan.
+        class _Stub(AerodromeLive):
+            def __init__(self):
+                self.max_gas_gwei = 0.1  # 0.1 gwei cap
+                self._eip1559 = True
+                self.w3 = MagicMock()
+                self.w3.eth.get_block.return_value = {"baseFeePerGas": int(0.5 * 1e9)}
+                self._nonce_manager = None
+                self._nonce_manager_addr = None
 
-        mock_w3 = MagicMock()
-        # baseFeePerGas = 0.5 gwei (way above cap)
-        mock_block = {"baseFeePerGas": int(0.5 * 1e9)}
-        mock_w3.eth.get_block.return_value = mock_block
-        bot.w3 = mock_w3
-
-        with pytest.raises(RuntimeError, match="baseFee.*gwei > cap.*aborting"):
-            AerodromeLive._build_fee_params(bot)
+        with pytest.raises(RuntimeError, match="aborting tx"):
+            _Stub()._build_fee_params()
 
     def test_build_fee_params_works_when_basefee_below_cap(self):
         """_build_fee_params returns EIP-1559 params when baseFee < cap."""
         from paperbot.live.aerodrome import AerodromeLive
 
-        bot = MagicMock(spec=AerodromeLive)
-        bot.max_gas_gwei = 0.1  # 0.1 gwei cap
-        bot._eip1559 = True
+        class _Stub(AerodromeLive):
+            def __init__(self):
+                self.max_gas_gwei = 0.1  # 0.1 gwei cap
+                self._eip1559 = True
+                self.w3 = MagicMock()
+                self.w3.eth.get_block.return_value = {"baseFeePerGas": int(0.005 * 1e9)}
+                self._nonce_manager = None
+                self._nonce_manager_addr = None
 
-        mock_w3 = MagicMock()
-        # baseFeePerGas = 0.005 gwei (well below cap)
-        mock_block = {"baseFeePerGas": int(0.005 * 1e9)}
-        mock_w3.eth.get_block.return_value = mock_block
-        bot.w3 = mock_w3
-
-        result = AerodromeLive._build_fee_params(bot)
-        assert "maxFeePerGas" in result
+        result = _Stub()._build_fee_params()
+        assert isinstance(result, dict)
+        assert result["maxFeePerGas"] <= int(0.1 * 1e9)
         assert "maxPriorityFeePerGas" in result
         # maxFeePerGas should be capped
         assert result["maxFeePerGas"] <= int(0.1 * 1e9)

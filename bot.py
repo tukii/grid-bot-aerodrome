@@ -17,6 +17,9 @@ LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 def cmd_fetch(args):
     cfg = load_config()
     df = geckoterminal.fetch_ohlcv(cfg["pool"]["address"], args.timeframe, limit=args.limit)
+    # FIX BAJA #1: defensive sort_index() at save point — guarantees CSV is
+    # always ascending (oldest first) regardless of API return order.
+    df = df.sort_index()
     cache = DATA_DIR / f"ohlcv_{args.timeframe}.csv"
     df.to_csv(cache)
     print(f"Descargadas {len(df)} velas {args.timeframe} -> {cache}")

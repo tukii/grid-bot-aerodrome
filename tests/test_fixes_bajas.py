@@ -361,7 +361,7 @@ def test_build_fee_params_raises_when_base_fee_exceeds_cap():
     """Si baseFeePerGas > cap, aborta con RuntimeError (fix BAJA round 10c)."""
     import pytest
     b = _make_bot(FakeW3EIP(base_fee=500_000_000), max_gas_gwei=0.1)
-    with pytest.raises(RuntimeError, match="baseFee.*gwei > cap"):
+    with pytest.raises(RuntimeError, match="aborting tx"):
         b._build_fee_params()
 
 
@@ -373,10 +373,12 @@ def test_eip1559_supported_detection():
 
 
 def test_gas_price_raises_when_above_cap():
-    """_gas_price (legacy path) aborta cuando gas > cap (fix BAJA round 10c)."""
+    """_gas_price (EIP-1559 path) aborta cuando baseFee > cap (fix BAJA round 10c)."""
     import pytest
-    b = _make_bot(FakeW3Legacy(gas_price=500_000_000), max_gas_gwei=0.1)
-    with pytest.raises(RuntimeError, match="network gas.*gwei > cap"):
+    b = _make_bot(FakeW3EIP(base_fee=500_000_000), max_gas_gwei=0.1)
+    with pytest.raises(RuntimeError, match="aborting tx"):
         b._gas_price()
-    b2 = _make_bot(FakeW3Legacy(gas_price=1_000_000), max_gas_gwei=0.1)
-    assert b2._gas_price() == 1_000_000  # por debajo del cap -> precio de red
+    b2 = _make_bot(FakeW3EIP(base_fee=1_000_000), max_gas_gwei=0.1)
+    result = b2._gas_price()
+    assert isinstance(result, dict)
+    assert result["maxFeePerGas"] <= 100_000_000  # <= cap

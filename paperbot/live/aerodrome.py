@@ -509,42 +509,14 @@ class AerodromeLive:
                 self._eip1559 = False
         return self._eip1559
 
-    def _gas_price(self) -> int:
-        """Gas price — raises if network gas exceeds cap (fix BAJA).
+    def _gas_price(self) -> dict:
+        """Gas price — returns fee params dict for build_transaction.
 
-        When the network gas price exceeds max_gas_gwei, raising is safer than
-        silently sending at a price that will never be mined. The caller
-        (swap_exact_in, wrap_eth, etc.) catches RuntimeError and aborts the tx.
-        """
-        gp = self.w3.eth.gas_price
-        cap = int(self.max_gas_gwei * 1e9)
-        if self.max_gas_gwei > 0 and gp > cap:
-            logger.warning(
-                "GAS CAP ABORT: network gas %.4f gwei exceeds cap %.4f gwei "
-                "— transaction will NOT be sent",
-                gp / 1e9, self.max_gas_gwei
-            )
-            raise RuntimeError(
-                f"network gas {gp / 1e9:.4f} gwei > cap {self.max_gas_gwei:.4f} gwei — "
-                f"aborting tx to avoid underpriced failure"
-            )
-        return gp
+        Returns EIP-1559 params {maxFeePerGas, maxPriorityFeePerGas} when the
+        network supports it (Base does). Falls back to legacy {gasPrice}.
+        Raises RuntimeError if network gas exceeds the configured cap.
 
-    def _build_fee_params(self) -> dict:
-        """Parámetros de gas para build_transaction (EIP-1559, fix BAJA).
-
-        Si la red soporta maxFeePerGas (Base sí: baseFeePerGas en el bloque
-        "latest"), construye la tx con maxFeePerGas/maxPriorityFeePerGas en lugar
-        de gasPrice legacy. El cap configurado (live.max_gas_gwei) es el límite
-        ESTRICTO de maxFeePerGas — nunca se supera.
-
-        Si base_fee > cap: aborta con RuntimeError (evita tx underpriced que
-        nunca será minada).
-
-        ALTO #4: si cap <= 0, raise ValueError (antes usaba gas_price sin cap,
-        lo cual podía enviar tx a precio de mercado sin límite).
-
-        Si la red NO soporta EIP-1559 -> gasPrice legacy con el mismo cap.
+        FIX BAJA #2: callers that need raw gasPrice can use .get("gasPrice").
         """
         cap = int(self.max_gas_gwei * 1e9)
         if cap <= 0:
@@ -556,17 +528,37 @@ class AerodromeLive:
             base_fee = int(self.w3.eth.get_block("latest")["baseFeePerGas"])
             if base_fee > cap:
                 raise RuntimeError(
-                    f"EIP-1559 baseFee {base_fee / 1e9:.4f} gwei > cap "
+                    f"network gas {base_fee / 1e9:.4f} gwei exceeds cap "
                     f"{self.max_gas_gwei:.4f} gwei — aborting tx"
                 )
-            tip = int(1e6)  # 0.001 gwei (Base: suficiente, base fee ~0.005 gwei)
+            tip = int(1e6)  # 0.001 gwei (Base typical)
             tip = min(tip, cap)
             max_fee = max(base_fee + tip, tip)
             max_fee = min(max_fee, cap)
-            logger.debug("EIP-1559 fees: baseFee=%s tip=%s maxFee=%s (cap=%s)",
-                         base_fee, tip, max_fee, cap)
+            logger.debug("EIP-1559 gas: baseFee=%s tip=%s maxFee=%s (cap=%s)",
+                         base_fee, tip, max_fee, self.max_gas_gwei)
             return {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": tip}
-        return {"gasPrice": self._gas_price()}
+        # Legacy fallback
+        gp = self.w3.eth.gas_price
+        if self.max_gas_gwei > 0 and gp > cap:
+            raise RuntimeError(
+                f"network gas {gp / 1e9:.4f} gwei > cap {self.max_gas_gwei:.4f} gwei — "
+                f"aborting tx to avoid underpriced failure"
+            )
+        return {"gasPrice": gp}
+
+    def _build_fee_params(self) -> dict:
+        """Parámetros de gas para build_transaction (EIP-1559, fix BAJA).
+
+        Delegates to _gas_price() which already handles EIP-1559 detection,
+        cap enforcement, and legacy fallback.
+
+        If cap <= 0, raise ValueError (antes usaba gas_price sin cap,
+        lo cual podía enviar tx a precio de mercado sin límite).
+
+        Si la red NO soporta EIP-1559 -> gasPrice legacy con el mismo cap.
+        """
+        return self._gas_price()
 
     def _estimate_gas(self, tx: dict) -> int:
         try:
@@ -771,6 +763,9 @@ class AerodromeLive:
                     time.sleep(2 ** attempt)
                     continue
                 # "nonce too low" = desincronización de nonce, no transitorio; no reintenta
+                if "nonce too low" in msg and nonce_mgr:
+                    nonce_mgr.resync_if_behind()
+                    logger.warning("%s nonce too low -> resynced (next attempt may succeed)", label)
                 logger.error("%s failed (attempt %d): %s", label, attempt + 1, e)
                 return False, None, None
         logger.error("%s failed after retries: %s", label, last_err)
