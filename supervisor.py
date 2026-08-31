@@ -19,6 +19,7 @@ Seguridad:
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -422,6 +423,32 @@ def main_loop():
                     drift = abs(price - anchor) / anchor * 100
                     reanchor_pct = float(read_config().get("grid", {}).get("drift_reanchor_pct", 5.0))
                     cooldown = time.time() - state.get("last_reanchor_ts", 0)
+
+                    # DETECTOR DE RÉGIMEN: si hay tendencia direccional fuerte en 24h
+                    # (precio moviéndose >5% en una dirección), el grid fijo se queda
+                    # atrás (el buy&hold gana +29% vs +0.67% en tendencia alcista).
+                    # En tendencia, re-anclamos con cooldown MUCHO menor (15 min) para
+                    # que el grid "surfee" la tendencia en vez de quedarse anclado.
+                    trend = 0.0
+                    try:
+                        import subprocess as _sp
+                        r = _sp.run(["tail", "-n", "500", str(BASE / "data" / "live.log")],
+                                    capture_output=True, text=True, timeout=10)
+                        prices24h = []
+                        for line in r.stdout.splitlines():
+                            m = re.search(r"price=([0-9.]+)", line)
+                            if m:
+                                prices24h.append(float(m.group(1)))
+                        if len(prices24h) >= 24:
+                            trend = (prices24h[-1] - prices24h[0]) / prices24h[0] * 100
+                    except Exception as e:
+                        log.debug("régimen: no pude leer tendencia (%s)", e)
+                    regime_trending = abs(trend) >= 5.0
+                    if regime_trending:
+                        cooldown = min(cooldown, 900)  # 15 min en tendencia
+                        reanchor_pct = min(reanchor_pct, 3.0)  # drift 3% basta en tendencia
+                        log.info("RÉGIMEN: tendencia %+.1f%%/24h -> re-anchor frecuente (drift>=3%%)", trend)
+
                     if drift > reanchor_pct and cooldown > 3600:
                         log.info("drift %.2f%% > reanchor %.1f%% -> re-anclar a $%.2f", drift, reanchor_pct, price)
                         log_action(state, "reanchor", f"drift {drift:.2f}% -> ${price:.2f}")
