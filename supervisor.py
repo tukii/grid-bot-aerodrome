@@ -357,6 +357,19 @@ def main_loop():
             halted = read_meta("halted")
             if halted and halted.strip().lower() in ("1", "true", "yes"):
                 log.info("halted=true en DB -> supervisor no reinicia el bot")
+                # El grid está parado a propósito; vigilar el bot de RÉGIMEN (el
+                # que opera ahora): si regime-bot.service cae, reiniciarlo.
+                try:
+                    r = subprocess.run(["systemctl", "--user", "is-active", "regime-bot.service"],
+                                       capture_output=True, text=True, timeout=10)
+                    if r.stdout.strip() != "active":
+                        log.warning("regime-bot.service NO activo -> reiniciando")
+                        subprocess.run(["systemctl", "--user", "restart", "regime-bot.service"],
+                                       capture_output=True, text=True, timeout=30)
+                        log_action(state, "restart_regime_bot", "regime-bot caído")
+                        send_telegram("🔄 regime-bot caído -> reiniciado por supervisor")
+                except Exception as e:
+                    log.debug("check regime-bot: %s", e)
                 time.sleep(60)
                 continue
 
